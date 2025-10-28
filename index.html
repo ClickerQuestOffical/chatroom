@@ -1,0 +1,1332 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Global Chatroom</title>
+</head>
+<body>
+    <div id="app"></div>
+
+    <script type="module">
+        import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+
+        const supabase = createClient(
+            'https://hxgyosaofvxwongalvwr.supabase.co',
+            'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh4Z3lvc2FvZnZ4d29uZ2FsdndyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjEzMzA4NjYsImV4cCI6MjA3NjkwNjg2Nn0.O20SfjvTGV2O7X2cKt6jhRXe06BbqTLb8I_j7bv0Obo'
+        );
+
+        const VERSION = 'v6.0';
+        const CHANGELOG = [
+            { version: 'v6.0', changes: ['Profile customization', 'Profile pictures', 'User bios', 'Profile cards', 'Audio fix'] },
+            { version: 'v5.0', changes: ['DMs and Groups', 'Sidebar navigation', 'Unread notifications', 'Message options menu'] },
+            { version: 'v4.0', changes: ['Login/Signup system', 'Guest mode', 'Account protection'] },
+            { version: 'v3.2', changes: ['Camera capture', 'Take photos directly'] },
+            { version: 'v3.1', changes: ['Voice messages', 'Hold to record audio'] },
+            { version: 'v3.0', changes: ['Image uploads', 'GIF picker', 'Media support'] },
+            { version: 'v2.0', changes: ['Reply to messages', 'Online user count', 'Message timestamps', 'Version banner'] },
+            { version: 'v1.0', changes: ['Initial release', 'Basic chat functionality', 'Notifications'] }
+        ];
+
+        const GIFS = [
+            'https://media.giphy.com/media/3oriO0OEd9QIDdllqo/giphy.gif',
+            'https://media.giphy.com/media/ujUdrdpX7Ok5W/giphy.gif',
+            'https://media.giphy.com/media/ZdUnQS4AXEl1AERdil/giphy.gif',
+            'https://media.giphy.com/media/l3q2K5jinAlChoCLS/giphy.gif',
+            'https://media.giphy.com/media/XreQmk7ETCak0/giphy.gif'
+        ];
+
+        const DEFAULT_PROFILE_PIC = 'https://cdn-icons-png.flaticon.com/512/3177/3177440.png';
+
+        let username = '';
+        let isGuest = false;
+        let joined = false;
+        let notificationsEnabled = false;
+        let lastMessageCount = 0;
+        let replyingTo = null;
+        let onlineUsers = 0;
+        let showChangelog = false;
+        let showMediaPicker = false;
+        let isRecording = false;
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let cameraStream = null;
+        let showCamera = false;
+        let authMode = 'login';
+        let currentGroupId = null;
+        let groups = [];
+        let showMessageMenu = null;
+        let unreadCounts = {};
+        let showProfileEditor = false;
+        let showProfileCard = null;
+        let userProfile = { profile_picture: null, bio: 'No bio yet' };
+        let userProfiles = {};
+
+        async function requestNotificationPermission() {
+            if ('Notification' in window && Notification.permission === 'default') {
+                await Notification.requestPermission();
+            }
+        }
+
+        function showNotification(user, text) {
+            if (notificationsEnabled && Notification.permission === 'granted' && document.hidden) {
+                new Notification(`${user} says:`, {
+                    body: text || 'Sent media',
+                    icon: 'https://cdn-icons-png.flaticon.com/512/134/134914.png'
+                });
+            }
+        }
+
+        function formatTime(timestamp) {
+            const date = new Date(timestamp);
+            return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+        }
+
+        async function loadUserProfile() {
+            if (isGuest) return;
+            
+            try {
+                const { data } = await supabase
+                    .from('users')
+                    .select('profile_picture, bio')
+                    .eq('username', username)
+                    .single();
+                
+                if (data) {
+                    userProfile = {
+                        profile_picture: data.profile_picture || null,
+                        bio: data.bio || 'No bio yet'
+                    };
+                }
+            } catch (e) {
+                console.log('Error loading profile:', e);
+            }
+        }
+
+        async function loadOtherUserProfile(user) {
+            if (userProfiles[user]) return userProfiles[user];
+            
+            const cleanUsername = user.replace(' (GUEST)', '');
+            
+            try {
+                const { data } = await supabase
+                    .from('users')
+                    .select('profile_picture, bio')
+                    .eq('username', cleanUsername)
+                    .single();
+                
+                if (data) {
+                    userProfiles[user] = {
+                        profile_picture: data.profile_picture || null,
+                        bio: data.bio || 'No bio yet'
+                    };
+                    return userProfiles[user];
+                }
+            } catch (e) {}
+            
+            return { profile_picture: null, bio: 'No bio yet' };
+        }
+
+        async function updateProfile(profilePic, bio) {
+            try {
+                await supabase
+                    .from('users')
+                    .update({ 
+                        profile_picture: profilePic, 
+                        bio: bio 
+                    })
+                    .eq('username', username);
+                
+                userProfile = { profile_picture: profilePic, bio: bio };
+                userProfiles[username] = userProfile;
+                showProfileEditor = false;
+                render();
+            } catch (e) {
+                alert('Error updating profile: ' + e.message);
+            }
+        }
+
+        async function updateOnlineCount() {
+            try {
+                const displayName = isGuest ? `${username} (GUEST)` : username;
+                await supabase.from('online_users').upsert([
+                    { username: displayName, last_seen: new Date().toISOString() }
+                ], { onConflict: 'username' });
+
+                const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+                const { data } = await supabase
+                    .from('online_users')
+                    .select('username')
+                    .gte('last_seen', fiveMinutesAgo);
+
+                onlineUsers = data ? data.length : 0;
+            } catch (e) {
+                console.log('Online count feature needs online_users table');
+            }
+        }
+
+        async function loadGroups() {
+            if (isGuest) return;
+            
+            try {
+                const { data } = await supabase
+                    .from('groups')
+                    .select('*')
+                    .contains('members', [username]);
+                
+                if (data) {
+                    groups = data;
+                }
+
+                const { data: unreadData } = await supabase
+                    .from('unread_messages')
+                    .select('*')
+                    .eq('username', username);
+                
+                if (unreadData) {
+                    unreadCounts = {};
+                    unreadData.forEach(item => {
+                        unreadCounts[item.group_id] = item.count;
+                    });
+                }
+            } catch (e) {
+                console.log('Error loading groups:', e);
+            }
+        }
+
+        async function markAsRead(groupId) {
+            if (!groupId || isGuest) return;
+            
+            try {
+                await supabase
+                    .from('unread_messages')
+                    .delete()
+                    .eq('username', username)
+                    .eq('group_id', groupId);
+                
+                unreadCounts[groupId] = 0;
+            } catch (e) {}
+        }
+
+        async function incrementUnread(groupId, excludeUser) {
+            if (!groupId) return;
+            
+            try {
+                const group = groups.find(g => g.id === groupId);
+                if (!group) return;
+                
+                for (const member of group.members) {
+                    if (member !== excludeUser) {
+                        const { data: existing } = await supabase
+                            .from('unread_messages')
+                            .select('*')
+                            .eq('username', member)
+                            .eq('group_id', groupId)
+                            .single();
+                        
+                        if (existing) {
+                            await supabase
+                                .from('unread_messages')
+                                .update({ count: existing.count + 1 })
+                                .eq('username', member)
+                                .eq('group_id', groupId);
+                        } else {
+                            await supabase
+                                .from('unread_messages')
+                                .insert([{ username: member, group_id: groupId, count: 1 }]);
+                        }
+                    }
+                }
+            } catch (e) {}
+        }
+
+        async function createDM(targetUser) {
+            if (isGuest) return;
+            
+            const existingDM = groups.find(g => 
+                g.is_dm && 
+                g.members.includes(username) && 
+                g.members.includes(targetUser)
+            );
+            
+            if (existingDM) {
+                currentGroupId = existingDM.id;
+                await markAsRead(currentGroupId);
+                render();
+                loadMessages();
+                return;
+            }
+            
+            try {
+                const { data } = await supabase
+                    .from('groups')
+                    .insert([{
+                        name: `DM with ${targetUser}`,
+                        members: [username, targetUser],
+                        is_dm: true,
+                        created_by: username
+                    }])
+                    .select()
+                    .single();
+                
+                if (data) {
+                    currentGroupId = data.id;
+                    await loadGroups();
+                    render();
+                    loadMessages();
+                }
+            } catch (e) {
+                alert('Error creating DM: ' + e.message);
+            }
+        }
+
+        function renderChangelog() {
+            if (!showChangelog) return '';
+            
+            return `
+                <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000;" id="changelogModal">
+                    <div style="background: white; margin: 50px auto; padding: 20px; max-width: 500px; border: 2px solid black; max-height: 70vh; overflow-y: auto;">
+                        <h2>Changelog</h2>
+                        ${CHANGELOG.map(log => `
+                            <div style="margin-bottom: 15px;">
+                                <strong>${log.version}</strong>
+                                <ul>
+                                    ${log.changes.map(change => `<li>${change}</li>`).join('')}
+                                </ul>
+                            </div>
+                        `).join('')}
+                        <button id="closeChangelog" style="padding: 5px 15px;">Close</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderProfileEditor() {
+            if (!showProfileEditor) return '';
+            
+            return `
+                <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000;" id="profileEditorModal">
+                    <div style="background: white; margin: 50px auto; padding: 20px; max-width: 400px; border: 2px solid black;">
+                        <h2>Edit Profile</h2>
+                        
+                        <div style="text-align: center; margin-bottom: 20px;">
+                            <img src="${userProfile.profile_picture || DEFAULT_PROFILE_PIC}" style="width: 100px; height: 100px; border-radius: 50%; border: 2px solid black;">
+                        </div>
+                        
+                        <div style="margin-bottom: 15px;">
+                            <label><strong>Profile Picture:</strong></label><br>
+                            <input type="file" id="profilePicUpload" accept="image/*" style="padding: 5px; margin-top: 5px;">
+                        </div>
+                        
+                        <div style="margin-bottom: 15px;">
+                            <label><strong>Bio:</strong></label><br>
+                            <textarea id="bioInput" style="width: 100%; padding: 5px; height: 80px; margin-top: 5px;">${userProfile.bio}</textarea>
+                        </div>
+                        
+                        <button id="saveProfileBtn" style="padding: 10px 20px; margin-right: 10px;">Save</button>
+                        <button id="closeProfileEditor" style="padding: 10px 20px;">Cancel</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderProfileCard() {
+            if (!showProfileCard) return '';
+            
+            const profile = showProfileCard;
+            
+            return `
+                <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000;" id="profileCardModal">
+                    <div style="background: white; margin: 100px auto; padding: 20px; max-width: 300px; border: 2px solid black; text-align: center;">
+                        <img src="${profile.profile_picture || DEFAULT_PROFILE_PIC}" style="width: 80px; height: 80px; border-radius: 50%; border: 2px solid black; margin-bottom: 10px;">
+                        <h2 style="margin: 10px 0;">${profile.username}</h2>
+                        <p style="color: gray; font-style: italic;">"${profile.bio}"</p>
+                        <button id="closeProfileCard" style="padding: 8px 16px; margin-top: 10px;">Close</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderMediaPicker() {
+            if (!showMediaPicker) return '';
+            
+            if (showCamera) {
+                return `
+                    <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.9); z-index: 1000;" id="cameraModal">
+                        <div style="background: white; margin: 20px auto; padding: 20px; max-width: 600px; border: 2px solid black; text-align: center;">
+                            <h2>Take a Photo</h2>
+                            <video id="cameraPreview" autoplay style="width: 100%; max-width: 500px; border: 2px solid black;"></video>
+                            <canvas id="photoCanvas" style="display: none;"></canvas>
+                            <div style="margin-top: 10px;">
+                                <button id="captureBtn" style="padding: 10px 20px; font-size: 16px; margin-right: 10px;">📸 Capture</button>
+                                <button id="closeCameraBtn" style="padding: 10px 20px;">Cancel</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+            
+            return `
+                <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000;" id="mediaPickerModal">
+                    <div style="background: white; margin: 50px auto; padding: 20px; max-width: 500px; border: 2px solid black; max-height: 500px; overflow-y: auto;">
+                        <h2>Choose Media</h2>
+                        
+                        <div style="margin-bottom: 20px;">
+                            <h3>Take Photo</h3>
+                            <button id="openCameraBtn" style="padding: 10px 20px; font-size: 16px;">📷 Open Camera</button>
+                        </div>
+                        
+                        <div style="margin-bottom: 20px;">
+                            <h3>Upload Image</h3>
+                            <input type="file" id="imageUpload" accept="image/*" style="padding: 5px;">
+                            <button id="uploadBtn" style="padding: 5px 15px; margin-left: 10px;">Upload</button>
+                        </div>
+                        
+                        <div>
+                            <h3>Choose GIF</h3>
+                            <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
+                                ${GIFS.map((gif, index) => `
+                                    <img src="${gif}" style="width: 100%; cursor: pointer; border: 2px solid black;" class="gif-option" data-gif="${gif}">
+                                `).join('')}
+                            </div>
+                        </div>
+                        
+                        <button id="closeMediaPicker" style="padding: 5px 15px; margin-top: 20px;">Close</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderSidebar() {
+            if (!joined || isGuest) return '';
+            
+            return `
+                <div style="width: 250px; background: lightgray; padding: 10px; border-right: 2px solid black; height: 100vh; overflow-y: auto; position: fixed; left: 0; top: 0; display: flex; flex-direction: column;">
+                    <div style="flex: 1;">
+                        <h3 style="margin-top: 0;">Chats</h3>
+                        
+                        <div style="padding: 10px; background: ${!currentGroupId ? 'white' : 'transparent'}; border: 1px solid black; margin-bottom: 5px; cursor: pointer;" id="mainChatBtn">
+                            <strong>🌍 Everyone</strong>
+                        </div>
+                        
+                        <h4>DMs</h4>
+                        ${groups.filter(g => g.is_dm).map(g => {
+                            const otherUser = g.members.find(m => m !== username);
+                            const unread = unreadCounts[g.id] || 0;
+                            return `
+                                <div style="padding: 8px; background: ${currentGroupId === g.id ? 'white' : 'transparent'}; border: 1px solid black; margin-bottom: 3px; cursor: pointer; position: relative;" class="group-btn" data-group-id="${g.id}">
+                                    💬 ${otherUser}
+                                    ${unread > 0 ? `<span style="position: absolute; right: 8px; top: 8px; background: red; color: white; border-radius: 50%; width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center; font-size: 11px;">${unread}</span>` : ''}
+                                </div>
+                            `;
+                        }).join('') || '<p style="font-size: 12px; color: gray;">No DMs yet</p>'}
+                        
+                        <h4>Groups</h4>
+                        ${groups.filter(g => !g.is_dm).map(g => {
+                            const unread = unreadCounts[g.id] || 0;
+                            return `
+                                <div style="padding: 8px; background: ${currentGroupId === g.id ? 'white' : 'transparent'}; border: 1px solid black; margin-bottom: 3px; cursor: pointer; position: relative;" class="group-btn" data-group-id="${g.id}">
+                                    👥 ${g.name}
+                                    ${unread > 0 ? `<span style="position: absolute; right: 8px; top: 8px; background: red; color: white; border-radius: 50%; width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center; font-size: 11px;">${unread}</span>` : ''}
+                                </div>
+                            `;
+                        }).join('') || '<p style="font-size: 12px; color: gray;">No groups yet</p>'}
+                    </div>
+                    
+                    <div style="border-top: 2px solid black; padding-top: 10px; margin-top: 10px;">
+                        <div style="display: flex; align-items: center; cursor: pointer;" id="userProfileBtn">
+                            <img src="${userProfile.profile_picture || DEFAULT_PROFILE_PIC}" style="width: 40px; height: 40px; border-radius: 50%; border: 2px solid black; margin-right: 10px;">
+                            <div>
+                                <strong>${username}</strong><br>
+                                <span style="font-size: 12px; color: gray;">View Profile</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function render() {
+            const appDiv = document.getElementById('app');
+            
+            if (!joined) {
+                appDiv.innerHTML = `
+                    <div style="padding: 20px; font-family: Arial;">
+                        <div style="background: black; color: white; padding: 10px; margin: -20px -20px 20px -20px; text-align: center;">
+                            <strong>Global Chatroom ${VERSION}</strong>
+                            <button id="showChangelogBtn" style="margin-left: 10px; padding: 3px 8px; font-size: 12px;">What's New</button>
+                        </div>
+                        <h1>Global Chatroom</h1>
+                        
+                        <div style="margin-bottom: 20px; border-bottom: 2px solid black; padding-bottom: 10px;">
+                            <button id="loginTabBtn" style="padding: 10px 20px; background: ${authMode === 'login' ? 'black' : 'white'}; color: ${authMode === 'login' ? 'white' : 'black'}; border: 1px solid black; margin-right: 5px;">Login</button>
+                            <button id="signupTabBtn" style="padding: 10px 20px; background: ${authMode === 'signup' ? 'black' : 'white'}; color: ${authMode === 'signup' ? 'white' : 'black'}; border: 1px solid black; margin-right: 5px;">Sign Up</button>
+                            <button id="guestTabBtn" style="padding: 10px 20px; background: ${authMode === 'guest' ? 'black' : 'white'}; color: ${authMode === 'guest' ? 'white' : 'black'}; border: 1px solid black;">Guest</button>
+                        </div>
+                        
+                        ${authMode === 'login' ? `
+                            <div>
+                                <h2>Login</h2>
+                                <input type="text" id="loginUsername" placeholder="Username" style="padding: 5px; display: block; width: 200px; margin-bottom: 10px;">
+                                <input type="password" id="loginPassword" placeholder="Password" style="padding: 5px; display: block; width: 200px; margin-bottom: 10px;">
+                                <button id="loginBtn" style="padding: 10px 20px;">Login</button>
+                                <div id="loginError" style="color: red; margin-top: 10px;"></div>
+                            </div>
+                        ` : ''}
+                        
+                        ${authMode === 'signup' ? `
+                            <div>
+                                <h2>Sign Up</h2>
+                                <input type="text" id="signupUsername" placeholder="Choose Username" style="padding: 5px; display: block; width: 200px; margin-bottom: 10px;">
+                                <input type="password" id="signupPassword" placeholder="Choose Password" style="padding: 5px; display: block; width: 200px; margin-bottom: 10px;">
+                                <button id="signupBtn" style="padding: 10px 20px;">Sign Up</button>
+                                <div id="signupError" style="color: red; margin-top: 10px;"></div>
+                            </div>
+                        ` : ''}
+                        
+                        ${authMode === 'guest' ? `
+                            <div>
+                                <h2>Join as Guest</h2>
+                                <p>No account needed - your messages will show as "(GUEST)"</p>
+                                <p style="color: red; font-size: 14px;">⚠️ Guests cannot use DMs, Groups, or Profiles</p>
+                                <input type="text" id="guestUsername" placeholder="Guest Username" style="padding: 5px; display: block; width: 200px; margin-bottom: 10px;">
+                                <button id="guestBtn" style="padding: 10px 20px;">Join as Guest</button>
+                            </div>
+                        ` : ''}
+                    </div>
+                    ${renderChangelog()}
+                `;
+                
+                document.getElementById('loginTabBtn').onclick = () => { authMode = 'login'; render(); };
+                document.getElementById('signupTabBtn').onclick = () => { authMode = 'signup'; render(); };
+                document.getElementById('guestTabBtn').onclick = () => { authMode = 'guest'; render(); };
+                
+                const showBtn = document.getElementById('showChangelogBtn');
+                if (showBtn) {
+                    showBtn.onclick = () => { showChangelog = true; render(); };
+                }
+
+                const closeBtn = document.getElementById('closeChangelog');
+                if (closeBtn) {
+                    closeBtn.onclick = () => { showChangelog = false; render(); };
+                }
+
+                const modal = document.getElementById('changelogModal');
+                if (modal) {
+                    modal.onclick = (e) => {
+                        if (e.target === modal) { showChangelog = false; render(); }
+                    };
+                }
+                
+                const loginBtn = document.getElementById('loginBtn');
+                if (loginBtn) {
+                    loginBtn.onclick = handleLogin;
+                    const passInput = document.getElementById('loginPassword');
+                    if (passInput) {
+                        passInput.onkeypress = (e) => { if (e.key === 'Enter') handleLogin(); };
+                    }
+                }
+                
+                const signupBtn = document.getElementById('signupBtn');
+                if (signupBtn) {
+                    signupBtn.onclick = handleSignup;
+                    const passInput = document.getElementById('signupPassword');
+                    if (passInput) {
+                        passInput.onkeypress = (e) => { if (e.key === 'Enter') handleSignup(); };
+                    }
+                }
+                
+                const guestBtn = document.getElementById('guestBtn');
+                if (guestBtn) {
+                    guestBtn.onclick = handleGuest;
+                    const userInput = document.getElementById('guestUsername');
+                    if (userInput) {
+                        userInput.onkeypress = (e) => { if (e.key === 'Enter') handleGuest(); };
+                    }
+                }
+            } else {
+                const displayName = isGuest ? `${username} (GUEST)` : username;
+                const currentGroup = groups.find(g => g.id === currentGroupId);
+                const chatTitle = currentGroupId ? (currentGroup ? currentGroup.name : 'Loading...') : 'Everyone';
+                
+                appDiv.innerHTML = `
+                    ${renderSidebar()}
+                    <div style="margin-left: ${isGuest ? '0' : '250px'}; padding: 20px; font-family: Arial;">
+                        <div style="background: black; color: white; padding: 10px; margin: -20px -20px 20px -20px; text-align: center;">
+                            <strong>Global Chatroom ${VERSION}</strong>
+                            <button id="showChangelogBtn" style="margin-left: 10px; padding: 3px 8px; font-size: 12px;">What's New</button>
+                            ${!currentGroupId ? `<span style="margin-left: 20px;">👥 ${onlineUsers} online</span>` : ''}
+                        </div>
+                        <h1>${chatTitle}</h1>
+                        <p>Logged in as: <strong>${displayName}</strong></p>
+                        <div style="margin-bottom: 10px;">
+                            <label>
+                                <input type="checkbox" id="notifToggle" ${notificationsEnabled ? 'checked' : ''}>
+                                Enable Notifications
+                            </label>
+                        </div>
+                        ${replyingTo ? `
+                            <div style="background: lightgray; padding: 5px; margin-bottom: 10px;">
+                                Replying to <strong>${replyingTo.username}</strong>: ${replyingTo.text || '[Media]'}
+                                <button id="cancelReply" style="margin-left: 10px; padding: 2px 8px;">Cancel</button>
+                            </div>
+                        ` : ''}
+                        <div id="messages" style="border: 1px solid black; height: 400px; overflow-y: scroll; padding: 10px; margin-bottom: 10px;"></div>
+                        <div style="display: flex; gap: 5px;">
+                            <button id="mediaPlusBtn" style="padding: 5px 15px; font-size: 18px;">+</button>
+                            <input type="text" id="messageInput" placeholder="Type message..." style="padding: 5px; flex: 1;">
+                            <button id="voiceBtn" style="padding: 5px 15px; font-size: 18px; background: ${isRecording ? 'red' : 'white'};">🎤</button>
+                            <button id="sendBtn" style="padding: 5px 15px;">Send</button>
+                        </div>
+                        ${isRecording ? '<div style="margin-top: 5px; color: red;">Recording... Hold button</div>' : ''}
+                    </div>
+                    ${renderChangelog()}
+                    ${renderMediaPicker()}
+                    ${renderProfileEditor()}
+                    ${renderProfileCard()}
+                `;
+
+                // Profile editor handlers
+                const saveProfileBtn = document.getElementById('saveProfileBtn');
+                if (saveProfileBtn) {
+                    saveProfileBtn.onclick = async () => {
+                        const bioInput = document.getElementById('bioInput');
+                        const profilePicInput = document.getElementById('profilePicUpload');
+                        
+                        let newProfilePic = userProfile.profile_picture;
+                        
+                        if (profilePicInput.files[0]) {
+                            const file = profilePicInput.files[0];
+                            if (file.size > 5000000) {
+                                alert('Image too large! Max 5MB');
+                                return;
+                            }
+                            
+                            const fileName = `${username}_${Date.now()}.jpg`;
+                            try {
+                                const { data, error } = await supabase.storage
+                                    .from('profile-pictures')
+                                    .upload(fileName, file);
+
+                                if (error) throw error;
+
+                                const { data: publicURL } = supabase.storage
+                                    .from('profile-pictures')
+                                    .getPublicUrl(fileName);
+                                
+                                newProfilePic = publicURL.publicUrl;
+                            } catch (e) {
+                                alert('Error uploading profile picture: ' + e.message);
+                                return;
+                            }
+                        }
+                        
+                        await updateProfile(newProfilePic, bioInput.value.trim());
+                    };
+                }
+
+                const closeProfileEditor = document.getElementById('closeProfileEditor');
+                if (closeProfileEditor) {
+                    closeProfileEditor.onclick = () => {
+                        showProfileEditor = false;
+                        render();
+                    };
+                }
+
+                const profileEditorModal = document.getElementById('profileEditorModal');
+                if (profileEditorModal) {
+                    profileEditorModal.onclick = (e) => {
+                        if (e.target === profileEditorModal) {
+                            showProfileEditor = false;
+                            render();
+                        }
+                    };
+                }
+
+                const closeProfileCard = document.getElementById('closeProfileCard');
+                if (closeProfileCard) {
+                    closeProfileCard.onclick = () => {
+                        showProfileCard = null;
+                        render();
+                    };
+                }
+
+                const profileCardModal = document.getElementById('profileCardModal');
+                if (profileCardModal) {
+                    profileCardModal.onclick = (e) => {
+                        if (e.target === profileCardModal) {
+                            showProfileCard = null;
+                            render();
+                        }
+                    };
+                }
+
+                const userProfileBtn = document.getElementById('userProfileBtn');
+                if (userProfileBtn) {
+                    userProfileBtn.onclick = () => {
+                        showProfileEditor = true;
+                        render();
+                    };
+                }
+
+                const mainChatBtn = document.getElementById('mainChatBtn');
+                if (mainChatBtn) {
+                    mainChatBtn.onclick = async () => {
+                        currentGroupId = null;
+                        await markAsRead(null);
+                        render();
+                        loadMessages();
+                    };
+                }
+
+                const groupBtns = document.querySelectorAll('.group-btn');
+                groupBtns.forEach(btn => {
+                    btn.onclick = async () => {
+                        currentGroupId = btn.dataset.groupId;
+                        await markAsRead(currentGroupId);
+                        render();
+                        loadMessages();
+                    };
+                });
+
+                const showBtn = document.getElementById('showChangelogBtn');
+                if (showBtn) {
+                    showBtn.onclick = () => { showChangelog = true; render(); };
+                }
+
+                const closeBtn = document.getElementById('closeChangelog');
+                if (closeBtn) {
+                    closeBtn.onclick = () => { showChangelog = false; render(); };
+                }
+
+                const modal = document.getElementById('changelogModal');
+                if (modal) {
+                    modal.onclick = (e) => {
+                        if (e.target === modal) { showChangelog = false; render(); }
+                    };
+                }
+
+                const cancelBtn = document.getElementById('cancelReply');
+                if (cancelBtn) {
+                    cancelBtn.onclick = () => {
+                        replyingTo = null;
+                        render();
+                    };
+                }
+
+                const mediaPlusBtn = document.getElementById('mediaPlusBtn');
+                if (mediaPlusBtn) {
+                    mediaPlusBtn.onclick = () => {
+                        showMediaPicker = true;
+                        render();
+                    };
+                }
+
+                const closeMediaBtn = document.getElementById('closeMediaPicker');
+                if (closeMediaBtn) {
+                    closeMediaBtn.onclick = () => {
+                        showMediaPicker = false;
+                        render();
+                    };
+                }
+
+                const mediaModal = document.getElementById('mediaPickerModal');
+                if (mediaModal) {
+                    mediaModal.onclick = (e) => {
+                        if (e.target === mediaModal) {
+                            showMediaPicker = false;
+                            render();
+                        }
+                    };
+                }
+
+                const uploadBtn = document.getElementById('uploadBtn');
+                if (uploadBtn) {
+                    uploadBtn.onclick = handleImageUpload;
+                }
+
+                const openCameraBtn = document.getElementById('openCameraBtn');
+                if (openCameraBtn) {
+                    openCameraBtn.onclick = openCamera;
+                }
+
+                const captureBtn = document.getElementById('captureBtn');
+                if (captureBtn) {
+                    captureBtn.onclick = capturePhoto;
+                }
+
+                const closeCameraBtn = document.getElementById('closeCameraBtn');
+                if (closeCameraBtn) {
+                    closeCameraBtn.onclick = closeCamera;
+                }
+
+                const gifOptions = document.querySelectorAll('.gif-option');
+                gifOptions.forEach(gif => {
+                    gif.onclick = () => {
+                        sendGif(gif.dataset.gif);
+                    };
+                });
+
+                const voiceBtn = document.getElementById('voiceBtn');
+                if (voiceBtn) {
+                    voiceBtn.onmousedown = startRecording;
+                    voiceBtn.onmouseup = stopRecording;
+                    voiceBtn.onmouseleave = stopRecording;
+                    voiceBtn.ontouchstart = (e) => {
+                        e.preventDefault();
+                        startRecording();
+                    };
+                    voiceBtn.ontouchend = (e) => {
+                        e.preventDefault();
+                        stopRecording();
+                    };
+                }
+                
+                document.getElementById('notifToggle').onchange = async (e) => {
+                    notificationsEnabled = e.target.checked;
+                    if (notificationsEnabled && Notification.permission === 'default') {
+                        await requestNotificationPermission();
+                    }
+                };
+                
+                document.getElementById('sendBtn').onclick = sendMessage;
+                document.getElementById('messageInput').onkeypress = (e) => {
+                    if (e.key === 'Enter') sendMessage();
+                };
+            }
+        }
+
+        async function handleLogin() {
+            const usernameInput = document.getElementById('loginUsername');
+            const passwordInput = document.getElementById('loginPassword');
+            const errorDiv = document.getElementById('loginError');
+            
+            const user = usernameInput.value.trim();
+            const pass = passwordInput.value.trim();
+            
+            if (!user || !pass) {
+                errorDiv.textContent = 'Please enter username and password';
+                return;
+            }
+            
+            try {
+                const { data, error } = await supabase
+                    .from('users')
+                    .select('*')
+                    .eq('username', user)
+                    .single();
+                
+                if (error || !data) {
+                    errorDiv.textContent = 'Username not found';
+                    return;
+                }
+                
+                if (data.password !== pass) {
+                    errorDiv.textContent = 'Incorrect password';
+                    return;
+                }
+                
+                username = user;
+                isGuest = false;
+                joined = true;
+                await requestNotificationPermission();
+                await loadUserProfile();
+                await loadGroups();
+                render();
+                loadMessages();
+                updateOnlineCount();
+                setInterval(loadMessages, 2000);
+                setInterval(updateOnlineCount, 30000);
+                setInterval(loadGroups, 5000);
+            } catch (e) {
+                errorDiv.textContent = 'Error logging in: ' + e.message;
+            }
+        }
+
+        async function handleSignup() {
+            const usernameInput = document.getElementById('signupUsername');
+            const passwordInput = document.getElementById('signupPassword');
+            const errorDiv = document.getElementById('signupError');
+            
+            const user = usernameInput.value.trim();
+            const pass = passwordInput.value.trim();
+            
+            if (!user || !pass) {
+                errorDiv.textContent = 'Please enter username and password';
+                return;
+            }
+            
+            if (user.length < 3) {
+                errorDiv.textContent = 'Username must be at least 3 characters';
+                return;
+            }
+            
+            if (pass.length < 4) {
+                errorDiv.textContent = 'Password must be at least 4 characters';
+                return;
+            }
+            
+            try {
+                const { data: existing } = await supabase
+                    .from('users')
+                    .select('username')
+                    .eq('username', user)
+                    .single();
+                
+                if (existing) {
+                    errorDiv.textContent = 'Username already taken';
+                    return;
+                }
+                
+                const { error } = await supabase
+                    .from('users')
+                    .insert([{ username: user, password: pass }]);
+                
+                if (error) throw error;
+                
+                username = user;
+                isGuest = false;
+                joined = true;
+                await requestNotificationPermission();
+                await loadUserProfile();
+                await loadGroups();
+                render();
+                loadMessages();
+                updateOnlineCount();
+                setInterval(loadMessages, 2000);
+                setInterval(updateOnlineCount, 30000);
+                setInterval(loadGroups, 5000);
+            } catch (e) {
+                errorDiv.textContent = 'Error signing up: ' + e.message;
+            }
+        }
+
+        async function handleGuest() {
+            const usernameInput = document.getElementById('guestUsername');
+            const user = usernameInput.value.trim();
+            
+            if (!user) {
+                alert('Please enter a username');
+                return;
+            }
+            
+            username = user;
+            isGuest = true;
+            joined = true;
+            await requestNotificationPermission();
+            render();
+            loadMessages();
+            updateOnlineCount();
+            setInterval(loadMessages, 2000);
+            setInterval(updateOnlineCount, 30000);
+        }
+
+        async function handleImageUpload() {
+            const fileInput = document.getElementById('imageUpload');
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                alert('Please select an image first!');
+                return;
+            }
+
+            if (file.size > 5000000) {
+                alert('Image too large! Please choose an image under 5MB.');
+                return;
+            }
+
+            const fileName = `${Date.now()}_${file.name}`;
+            
+            try {
+                const { data, error } = await supabase.storage
+                    .from('chat-images')
+                    .upload(fileName, file);
+
+                if (error) throw error;
+
+                const { data: publicURL } = supabase.storage
+                    .from('chat-images')
+                    .getPublicUrl(fileName);
+
+                await sendImage(publicURL.publicUrl);
+                showMediaPicker = false;
+                render();
+            } catch (error) {
+                alert('Error uploading image: ' + error.message);
+            }
+        }
+
+        async function sendGif(gifUrl) {
+            await sendImage(gifUrl);
+            showMediaPicker = false;
+            render();
+        }
+
+        async function openCamera() {
+            try {
+                cameraStream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: 'user' } 
+                });
+                showCamera = true;
+                render();
+                
+                setTimeout(() => {
+                    const video = document.getElementById('cameraPreview');
+                    if (video) {
+                        video.srcObject = cameraStream;
+                    }
+                }, 100);
+            } catch (error) {
+                alert('Error accessing camera: ' + error.message);
+            }
+        }
+
+        function closeCamera() {
+            if (cameraStream) {
+                cameraStream.getTracks().forEach(track => track.stop());
+                cameraStream = null;
+            }
+            showCamera = false;
+            render();
+        }
+
+        async function capturePhoto() {
+            const video = document.getElementById('cameraPreview');
+            const canvas = document.getElementById('photoCanvas');
+            
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0);
+            
+            canvas.toBlob(async (blob) => {
+                const fileName = `${Date.now()}_photo.jpg`;
+                
+                try {
+                    const { data, error } = await supabase.storage
+                        .from('chat-images')
+                        .upload(fileName, blob);
+
+                    if (error) throw error;
+
+                    const { data: publicURL } = supabase.storage
+                        .from('chat-images')
+                        .getPublicUrl(fileName);
+
+                    await sendImage(publicURL.publicUrl);
+                    closeCamera();
+                    showMediaPicker = false;
+                    render();
+                } catch (error) {
+                    alert('Error uploading photo: ' + error.message);
+                }
+            }, 'image/jpeg');
+        }
+
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = (event) => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = async () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    await uploadVoiceMessage(audioBlob);
+                    stream.getTracks().forEach(track => track.stop());
+                };
+
+                mediaRecorder.start();
+                isRecording = true;
+                render();
+            } catch (error) {
+                alert('Error accessing microphone: ' + error.message);
+            }
+        }
+
+        async function stopRecording() {
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                isRecording = false;
+                render();
+            }
+        }
+
+        async function uploadVoiceMessage(audioBlob) {
+            const fileName = `${Date.now()}_voice.webm`;
+            
+            try {
+                const { data, error } = await supabase.storage
+                    .from('voice-messages')
+                    .upload(fileName, audioBlob);
+
+                if (error) throw error;
+
+                const { data: publicURL } = supabase.storage
+                    .from('voice-messages')
+                    .getPublicUrl(fileName);
+
+                await sendVoice(publicURL.publicUrl);
+            } catch (error) {
+                alert('Error uploading voice message: ' + error.message);
+            }
+        }
+
+        async function sendVoice(voiceUrl) {
+            const displayName = isGuest ? `${username} (GUEST)` : username;
+            const messageData = {
+                username: displayName,
+                text: '',
+                voice_url: voiceUrl,
+                group_id: currentGroupId
+            };
+            
+            if (replyingTo) {
+                messageData.reply_to = JSON.stringify({
+                    username: replyingTo.username,
+                    text: replyingTo.text
+                });
+            }
+            
+            await supabase.from('messages').insert([messageData]);
+            
+            if (currentGroupId) {
+                await incrementUnread(currentGroupId, username);
+            }
+            
+            replyingTo = null;
+            render();
+        }
+
+        async function sendImage(imageUrl) {
+            const displayName = isGuest ? `${username} (GUEST)` : username;
+            const messageData = {
+                username: displayName,
+                text: '',
+                image_url: imageUrl,
+                group_id: currentGroupId
+            };
+            
+            if (replyingTo) {
+                messageData.reply_to = JSON.stringify({
+                    username: replyingTo.username,
+                    text: replyingTo.text
+                });
+            }
+            
+            await supabase.from('messages').insert([messageData]);
+            
+            if (currentGroupId) {
+                await incrementUnread(currentGroupId, username);
+            }
+            
+            replyingTo = null;
+            render();
+        }
+
+        async function loadMessages() {
+            let query = supabase
+                .from('messages')
+                .select('*')
+                .order('created_at', { ascending: true })
+                .limit(50);
+            
+            if (currentGroupId) {
+                query = query.eq('group_id', currentGroupId);
+            } else {
+                query = query.is('group_id', null);
+            }
+            
+            const { data, error } = await query;
+
+            if (data) {
+                const messagesDiv = document.getElementById('messages');
+                if (messagesDiv) {
+                    const wasAtBottom = messagesDiv.scrollHeight - messagesDiv.scrollTop <= messagesDiv.clientHeight + 50;
+                    
+                    if (data.length > lastMessageCount && lastMessageCount > 0) {
+                        const newMessage = data[data.length - 1];
+                        const displayName = isGuest ? `${username} (GUEST)` : username;
+                        if (newMessage.username !== displayName) {
+                            showNotification(newMessage.username, newMessage.text);
+                        }
+                    }
+                    lastMessageCount = data.length;
+                    
+                    messagesDiv.innerHTML = '';
+                    
+                    for (const msg of data) {
+                        const msgDiv = document.createElement('div');
+                        msgDiv.style.marginBottom = '10px';
+                        msgDiv.style.padding = '5px';
+                        msgDiv.style.borderLeft = msg.reply_to ? '3px solid gray' : 'none';
+                        msgDiv.style.paddingLeft = msg.reply_to ? '10px' : '5px';
+                        msgDiv.style.display = 'flex';
+                        msgDiv.style.gap = '10px';
+                        msgDiv.dataset.messageId = msg.id;
+                        
+                        const userProfileData = await loadOtherUserProfile(msg.username);
+                        
+                        let html = '';
+                        
+                        if (!msg.username.includes('(GUEST)')) {
+                            html += `<div style="flex-shrink: 0;"><img src="${userProfileData.profile_picture || DEFAULT_PROFILE_PIC}" class="user-profile-pic" data-username="${msg.username}" style="width: 40px; height: 40px; border-radius: 50%; border: 2px solid black; cursor: pointer;"></div>`;
+                        }
+                        
+                        html += '<div style="flex: 1;">';
+                        
+                        if (msg.reply_to) {
+                            try {
+                                const replyData = JSON.parse(msg.reply_to);
+                                html += `<div style="font-size: 12px; color: gray; margin-bottom: 3px;">↩ Replying to ${replyData.username}</div>`;
+                            } catch (e) {}
+                        }
+                        
+                        html += `<strong>${msg.username}</strong> <span style="font-size: 11px; color: gray;">${formatTime(msg.created_at)}</span>`;
+                        
+                        if (!isGuest && !currentGroupId && !msg.username.includes('(GUEST)')) {
+                            html += `<span class="msg-menu-btn" data-username="${msg.username}" data-message-id="${msg.id}" style="float: right; cursor: pointer; padding: 2px 5px; display: none;">⋮</span>`;
+                        }
+                        
+                        html += '<br>';
+                        
+                        if (msg.image_url) {
+                            html += `<img src="${msg.image_url}" style="max-width: 300px; max-height: 300px; margin-top: 5px; border: 1px solid black;">`;
+                        }
+                        
+                        if (msg.voice_url) {
+                            html += `<div style="margin-top: 5px;"><audio controls preload="metadata"><source src="${msg.voice_url}" type="audio/webm"></audio></div>`;
+                        }
+                        
+                        if (msg.text) {
+                            html += msg.text;
+                        }
+                        
+                        html += '</div>';
+                        
+                        msgDiv.innerHTML = html;
+                        
+                        msgDiv.onmouseenter = () => {
+                            const menuBtn = msgDiv.querySelector('.msg-menu-btn');
+                            if (menuBtn) menuBtn.style.display = 'inline';
+                        };
+                        
+                        msgDiv.onmouseleave = () => {
+                            const menuBtn = msgDiv.querySelector('.msg-menu-btn');
+                            if (menuBtn && showMessageMenu !== msg.id) menuBtn.style.display = 'none';
+                        };
+                        
+                        messagesDiv.appendChild(msgDiv);
+                    }
+                    
+                    const profilePics = document.querySelectorAll('.user-profile-pic');
+                    profilePics.forEach(pic => {
+                        pic.onclick = async () => {
+                            const targetUsername = pic.dataset.username;
+                            const profile = await loadOtherUserProfile(targetUsername);
+                            showProfileCard = {
+                                username: targetUsername,
+                                profile_picture: profile.profile_picture,
+                                bio: profile.bio
+                            };
+                            render();
+                        };
+                    });
+                    
+                    const menuBtns = document.querySelectorAll('.msg-menu-btn');
+                    menuBtns.forEach(btn => {
+                        btn.onclick = (e) => {
+                            e.stopPropagation();
+                            const targetUser = btn.dataset.username;
+                            const messageId = btn.dataset.messageId;
+                            showMessageMenu = messageId;
+                            
+                            const existingMenu = document.getElementById('message-options-menu');
+                            if (existingMenu) existingMenu.remove();
+                            
+                            const menu = document.createElement('div');
+                            menu.id = 'message-options-menu';
+                            menu.style.position = 'absolute';
+                            menu.style.background = 'white';
+                            menu.style.border = '2px solid black';
+                            menu.style.padding = '10px';
+                            menu.style.zIndex = '999';
+                            menu.style.left = e.pageX + 'px';
+                            menu.style.top = e.pageY + 'px';
+                            
+                            menu.innerHTML = `
+                                <div style="cursor: pointer; padding: 5px; border-bottom: 1px solid gray;" id="dm-option">💬 Send DM</div>
+                                <div style="cursor: pointer; padding: 5px;" id="reply-option">↩ Reply</div>
+                            `;
+                            
+                            document.body.appendChild(menu);
+                            
+                            document.getElementById('dm-option').onclick = () => {
+                                createDM(targetUser);
+                                menu.remove();
+                                showMessageMenu = null;
+                            };
+                            
+                            document.getElementById('reply-option').onclick = () => {
+                                const msg = data.find(m => m.id == messageId);
+                                if (msg) {
+                                    replyingTo = { username: msg.username, text: msg.text, id: msg.id };
+                                    render();
+                                    document.getElementById('messageInput').focus();
+                                }
+                                menu.remove();
+                                showMessageMenu = null;
+                            };
+                            
+                            setTimeout(() => {
+                                document.addEventListener('click', function closeMenu() {
+                                    menu.remove();
+                                    showMessageMenu = null;
+                                    document.removeEventListener('click', closeMenu);
+                                });
+                            }, 100);
+                        };
+                    });
+                    
+                    if (wasAtBottom) {
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                    }
+                }
+            }
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('messageInput');
+            if (input.value.trim()) {
+                const displayName = isGuest ? `${username} (GUEST)` : username;
+                const messageData = {
+                    username: displayName,
+                    text: input.value.trim(),
+                    group_id: currentGroupId
+                };
+                
+                if (replyingTo) {
+                    messageData.reply_to = JSON.stringify({
+                        username: replyingTo.username,
+                        text: replyingTo.text
+                    });
+                }
+                
+                await supabase.from('messages').insert([messageData]);
+                
+                if (currentGroupId) {
+                    await incrementUnread(currentGroupId, username);
+                }
+                
+                input.value = '';
+                replyingTo = null;
+                render();
+            }
+        }
+
+        render();
+    </script>
+</body>
+</html>
